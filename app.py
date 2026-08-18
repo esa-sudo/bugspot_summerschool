@@ -1,26 +1,35 @@
+import hashlib
+import json
+import shutil
+import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import streamlit as st
 import yaml
 
 # Allow importing from ../bugspot-main/src without requiring package install.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BUGSPOT_SRC = PROJECT_ROOT / "bugspot-main" / "src"
-import sys
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR.parents[0] if APP_DIR.name != "" else APP_DIR
+BUGSPOT_SRC = APP_DIR / "bugspot-main" / "src"
 
 if str(BUGSPOT_SRC) not in sys.path:
     sys.path.insert(0, str(BUGSPOT_SRC))
 
 from bugspot import DetectionPipeline, get_default_config
 
+TEST_VIDEOS_DIR = APP_DIR / "test_videos"
+CACHE_DIR = APP_DIR / ".cache"
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+
 
 PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Background Model (GMM)": {
         "gmm_history": {
             "label": "Background memory length",
+            "unit": "frames",
             "kind": "int",
             "min": 10,
             "max": 5000,
@@ -29,6 +38,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "gmm_var_threshold": {
             "label": "Motion sensitivity threshold",
+            "unit": "intensity²",
             "kind": "float",
             "min": 1.0,
             "max": 100.0,
@@ -39,6 +49,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Morphological Filtering": {
         "morph_kernel_size": {
             "label": "Noise cleanup strength",
+            "unit": "px",
             "kind": "int",
             "min": 1,
             "max": 31,
@@ -49,6 +60,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Cohesiveness": {
         "min_largest_blob_ratio": {
             "label": "Require one dominant motion blob",
+            "unit": "ratio",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -57,6 +69,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "max_num_blobs": {
             "label": "Maximum separate motion islands",
+            "unit": "blobs",
             "kind": "int",
             "min": 1,
             "max": 50,
@@ -65,6 +78,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "min_motion_ratio": {
             "label": "Minimum motion fill",
+            "unit": "ratio",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -75,6 +89,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Shape": {
         "min_area": {
             "label": "Smallest object size",
+            "unit": "px²",
             "kind": "int",
             "min": 1,
             "max": 100000,
@@ -83,6 +98,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "max_area": {
             "label": "Largest object size",
+            "unit": "px²",
             "kind": "int",
             "min": 10,
             "max": 500000,
@@ -91,6 +107,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "min_density": {
             "label": "Compactness requirement",
+            "unit": "px",
             "kind": "float",
             "min": 0.0,
             "max": 20.0,
@@ -99,6 +116,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "min_solidity": {
             "label": "Smoothness requirement",
+            "unit": "ratio",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -109,6 +127,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Tracking": {
         "min_displacement": {
             "label": "Minimum net travel to confirm",
+            "unit": "px",
             "kind": "float",
             "min": 0.0,
             "max": 1000.0,
@@ -117,6 +136,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "min_path_points": {
             "label": "Minimum observations per track",
+            "unit": "frames",
             "kind": "int",
             "min": 1,
             "max": 200,
@@ -125,6 +145,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "max_frame_jump": {
             "label": "Max allowed jump per frame",
+            "unit": "px/frame",
             "kind": "float",
             "min": 1.0,
             "max": 1000.0,
@@ -133,6 +154,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "max_lost_frames": {
             "label": "How long to keep missing tracks",
+            "unit": "frames",
             "kind": "int",
             "min": 1,
             "max": 500,
@@ -141,6 +163,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "max_area_change_ratio": {
             "label": "Max size change between frames",
+            "unit": "×",
             "kind": "float",
             "min": 1.0,
             "max": 20.0,
@@ -151,6 +174,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Tracker Matching": {
         "tracker_w_dist": {
             "label": "Match weight: position",
+            "unit": "weight",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -159,6 +183,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "tracker_w_area": {
             "label": "Match weight: size",
+            "unit": "weight",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -167,6 +192,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "tracker_cost_threshold": {
             "label": "Strictness of matching",
+            "unit": "ratio",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -177,6 +203,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "Path Topology": {
         "max_revisit_ratio": {
             "label": "Max repeated-position behavior",
+            "unit": "ratio",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -185,6 +212,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "min_progression_ratio": {
             "label": "Min forward progression",
+            "unit": "ratio",
             "kind": "float",
             "min": 0.0,
             "max": 1.0,
@@ -193,6 +221,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "max_directional_variance": {
             "label": "Max direction variability",
+            "unit": "rad",
             "kind": "float",
             "min": 0.0,
             "max": 5.0,
@@ -201,6 +230,7 @@ PARAM_GROUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "revisit_radius": {
             "label": "Distance for counting a revisit",
+            "unit": "px",
             "kind": "float",
             "min": 1.0,
             "max": 2000.0,
@@ -244,6 +274,11 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _param_label(meta: Dict[str, Any]) -> str:
+    unit = meta.get("unit")
+    return f"{meta['label']} ({unit})" if unit else meta["label"]
+
+
 def _render_parameter_inputs(base_config: Dict[str, Any]) -> Dict[str, Any]:
     edited = dict(base_config)
 
@@ -252,9 +287,10 @@ def _render_parameter_inputs(base_config: Dict[str, Any]) -> Dict[str, Any]:
             for key, meta in params.items():
                 current = edited[key]
                 widget_key = f"param_{key}"
+                label = _param_label(meta)
                 if meta["kind"] == "int":
                     edited[key] = st.slider(
-                        meta["label"],
+                        label,
                         min_value=int(meta["min"]),
                         max_value=int(meta["max"]),
                         value=int(current),
@@ -264,7 +300,7 @@ def _render_parameter_inputs(base_config: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     edited[key] = st.slider(
-                        meta["label"],
+                        label,
                         min_value=float(meta["min"]),
                         max_value=float(meta["max"]),
                         value=float(current),
@@ -276,12 +312,47 @@ def _render_parameter_inputs(base_config: Dict[str, Any]) -> Dict[str, Any]:
     return _normalize_config(edited)
 
 
-def _save_uploaded_video(uploaded) -> Path:
-    suffix = Path(uploaded.name).suffix or ".mp4"
-    temp_dir = Path(tempfile.mkdtemp(prefix="bugspot_upload_"))
-    video_path = temp_dir / f"input{suffix}"
-    video_path.write_bytes(uploaded.getbuffer())
-    return video_path
+def _list_test_videos() -> List[Path]:
+    if not TEST_VIDEOS_DIR.exists():
+        return []
+    return sorted(
+        p for p in TEST_VIDEOS_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+
+def _save_uploaded_videos(uploaded_files) -> None:
+    TEST_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    for uploaded in uploaded_files:
+        dest = TEST_VIDEOS_DIR / uploaded.name
+        dest.write_bytes(uploaded.getbuffer())
+
+
+def _config_hash(config: Dict[str, Any]) -> str:
+    payload = json.dumps(config, sort_keys=True)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _cache_paths(config_hash: str, video_stem: str) -> Tuple[Path, Path, Path]:
+    result_dir = CACHE_DIR / config_hash / video_stem
+    return result_dir, result_dir / "annotated_result.mp4", result_dir / "summary.json"
+
+
+def _load_cached_result(config_hash: str, video_stem: str) -> Optional[Tuple[bytes, Dict[str, Any]]]:
+    _, video_path, summary_path = _cache_paths(config_hash, video_stem)
+    if video_path.exists() and summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        return video_path.read_bytes(), summary
+    return None
+
+
+def _store_cached_result(
+    config_hash: str, video_stem: str, video_bytes: bytes, summary: Dict[str, Any]
+) -> None:
+    result_dir, video_path, summary_path = _cache_paths(config_hash, video_stem)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(video_bytes)
+    summary_path.write_text(json.dumps(summary))
 
 
 def _annotate_output_video(
@@ -299,7 +370,7 @@ def _annotate_output_video(
 
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
-        raise ValueError("Could not open uploaded video for annotation")
+        raise ValueError("Could not open video for annotation")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -371,33 +442,138 @@ def _annotate_output_video(
     return out_path
 
 
-def _run_pipeline(uploaded_video, config: Dict[str, Any]) -> Tuple[Path, Dict[str, Any], str]:
-    input_path = _save_uploaded_video(uploaded_video)
+def _process_video(video_path: Path, config: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
     run_dir = Path(tempfile.mkdtemp(prefix="bugspot_run_"))
-    crops_dir = run_dir / "crops"
-    composites_dir = run_dir / "composites"
+    try:
+        pipeline = DetectionPipeline(config)
+        result = pipeline.process_video(
+            str(video_path),
+            extract_crops=False,
+            render_composites=False,
+        )
 
-    pipeline = DetectionPipeline(config)
-    result = pipeline.process_video(
-        str(input_path),
-        extract_crops=True,
-        render_composites=True,
-        save_crops_dir=str(crops_dir),
-        save_composites_dir=str(composites_dir),
+        confirmed = set(result.confirmed_tracks.keys())
+        out_path = _annotate_output_video(video_path, run_dir, result.all_detections, confirmed)
+
+        summary = {
+            "total_detections": len(result.all_detections),
+            "confirmed_tracks": len(result.confirmed_tracks),
+            "video_info": result.video_info,
+        }
+        return out_path.read_bytes(), summary
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _get_or_process(
+    video_path: Path, config: Dict[str, Any], config_hash: str
+) -> Tuple[bytes, Dict[str, Any]]:
+    cached = _load_cached_result(config_hash, video_path.stem)
+    if cached is not None:
+        return cached
+    video_bytes, summary = _process_video(video_path, config)
+    _store_cached_result(config_hash, video_path.stem, video_bytes, summary)
+    return video_bytes, summary
+
+
+def _display_result(video_name: str, video_bytes: bytes, summary: Dict[str, Any], key_prefix: str) -> None:
+    info = summary["video_info"]
+
+    stat1, stat2, stat3, stat4 = st.columns(4)
+    stat1.metric("Detections", summary["total_detections"])
+    stat2.metric("Confirmed Tracks", summary["confirmed_tracks"])
+    stat3.metric("FPS", f"{info['fps']:.2f}")
+    stat4.metric("Duration (s)", f"{info['duration']:.2f}")
+
+    st.video(video_bytes, format="video/mp4")
+    st.download_button(
+        "Download Annotated Video",
+        data=video_bytes,
+        file_name=f"bugspot_{Path(video_name).stem}_annotated.mp4",
+        mime="video/mp4",
+        use_container_width=True,
+        key=f"download_{key_prefix}_{video_name}",
     )
 
-    confirmed = set(result.confirmed_tracks.keys())
-    video_path = _annotate_output_video(input_path, run_dir, result.all_detections, confirmed)
 
-    summary = {
-        "total_detections": len(result.all_detections),
-        "confirmed_tracks": len(result.confirmed_tracks),
-        "video_info": result.video_info,
-        "output_dir": str(run_dir),
-    }
+def _video_nav(videos: List[Path], key_prefix: str) -> Path:
+    total = len(videos)
+    nav_prev, nav_label, nav_next = st.columns([1, 5, 1])
+    with nav_prev:
+        if st.button("◀", use_container_width=True, key=f"prev_{key_prefix}"):
+            st.session_state.video_idx = (st.session_state.video_idx - 1) % total
+    with nav_next:
+        if st.button("▶", use_container_width=True, key=f"next_{key_prefix}"):
+            st.session_state.video_idx = (st.session_state.video_idx + 1) % total
 
-    config_yaml = yaml.safe_dump(config, sort_keys=False)
-    return video_path, summary, config_yaml
+    with nav_label:
+        selected_idx = st.selectbox(
+            "Video",
+            options=list(range(total)),
+            index=st.session_state.video_idx,
+            format_func=lambda i: videos[i].name,
+            label_visibility="collapsed",
+            key=f"select_{key_prefix}",
+        )
+    if selected_idx != st.session_state.video_idx:
+        st.session_state.video_idx = selected_idx
+        st.rerun()
+
+    current_video = videos[st.session_state.video_idx]
+    st.caption(f"Video {st.session_state.video_idx + 1} of {total}: {current_video.name}")
+    return current_video
+
+
+def _render_single_mode(videos: List[Path], config: Dict[str, Any], config_hash: str) -> None:
+    current_video = _video_nav(videos, key_prefix="single")
+    cached = _load_cached_result(config_hash, current_video.stem)
+
+    process_col, status_col = st.columns([1, 3])
+    with process_col:
+        process_clicked = st.button(
+            "Process Video", type="primary", use_container_width=True, key="process_single"
+        )
+    with status_col:
+        if cached is not None:
+            st.success("Loaded from cache for the current config — no reprocessing needed.")
+        else:
+            st.info("Not processed yet for the current config.")
+
+    if process_clicked:
+        with st.spinner(f"Processing {current_video.name}..."):
+            video_bytes, summary = _get_or_process(current_video, config, config_hash)
+        _display_result(current_video.name, video_bytes, summary, key_prefix="single")
+    elif cached is not None:
+        video_bytes, summary = cached
+        _display_result(current_video.name, video_bytes, summary, key_prefix="single")
+
+
+def _render_batch_mode(videos: List[Path], config: Dict[str, Any], config_hash: str) -> None:
+    total = len(videos)
+    cached_count = sum(1 for v in videos if _load_cached_result(config_hash, v.stem) is not None)
+    st.caption(f"{cached_count}/{total} videos already processed for the current config.")
+
+    if st.button("Process All Videos", type="primary", use_container_width=True, key="process_all"):
+        progress = st.progress(0.0)
+        status = st.empty()
+        preview = st.empty()
+        for i, video in enumerate(videos):
+            status.write(f"Processing {video.name} ({i + 1}/{total})...")
+            video_bytes, summary = _get_or_process(video, config, config_hash)
+            with preview.container():
+                _display_result(video.name, video_bytes, summary, key_prefix="batch_preview")
+            progress.progress((i + 1) / total)
+        status.success("All videos processed.")
+
+    st.divider()
+    st.subheader("Review a processed video")
+    current_video = _video_nav(videos, key_prefix="batch")
+    cached = _load_cached_result(config_hash, current_video.stem)
+    if cached is not None:
+        video_bytes, summary = cached
+        _display_result(current_video.name, video_bytes, summary, key_prefix="batch_browse")
+    else:
+        st.info("This video hasn't been processed yet for the current config. Click 'Process All Videos' above.")
 
 
 def main() -> None:
@@ -406,8 +582,8 @@ def main() -> None:
 
     st.title("BugSpot Parameter Playground")
     st.write(
-        "Upload a video, tune detection parameters, update the config, run BugSpot, "
-        "and preview the annotated result video."
+        "Tune detection parameters on the left, then process the built-in test videos "
+        "and preview the annotated results on the right."
     )
     st.caption(
         "Use the help icon next to each setting to see a plain-language explanation "
@@ -420,28 +596,43 @@ def main() -> None:
         st.session_state.active_config = dict(default_cfg)
     if "config_yaml" not in st.session_state:
         st.session_state.config_yaml = yaml.safe_dump(st.session_state.active_config, sort_keys=False)
+    if "video_idx" not in st.session_state:
+        st.session_state.video_idx = 0
 
-    uploaded_video = st.file_uploader(
-        "Upload a video",
-        type=["mp4", "mov", "avi", "mkv", "m4v"],
-        accept_multiple_files=False,
-    )
+    videos = _list_test_videos()
+    if not videos:
+        st.subheader("Upload Test Videos")
+        st.info(
+            "No videos found on the server yet. Upload your test videos below — "
+            "they are saved to the server's disk, not committed to git, and only "
+            "need to be uploaded once per server session."
+        )
+        uploaded_videos = st.file_uploader(
+            "Upload test videos",
+            type=["mp4", "mov", "avi", "mkv", "m4v"],
+            accept_multiple_files=True,
+        )
+        if uploaded_videos:
+            with st.spinner("Saving uploaded videos..."):
+                _save_uploaded_videos(uploaded_videos)
+            st.rerun()
+        return
+    st.session_state.video_idx %= len(videos)
 
-    st.subheader("Config Parameters")
-    edited_config = _render_parameter_inputs(st.session_state.active_config)
+    left_col, right_col = st.columns([1, 2], gap="large")
 
-    col_a, col_b, col_c = st.columns([1, 1, 2])
-    with col_a:
+    with left_col:
+        st.subheader("Config Parameters")
+        edited_config = _render_parameter_inputs(st.session_state.active_config)
+
         if st.button("Update Config", use_container_width=True):
             st.session_state.active_config = edited_config
             st.session_state.config_yaml = yaml.safe_dump(edited_config, sort_keys=False)
-            st.success("Config updated. You can run BugSpot or download this config.")
-    with col_b:
+            st.success("Config updated. Unchanged videos stay cached; new results use this config.")
         if st.button("Reset to Defaults", use_container_width=True):
             st.session_state.active_config = dict(default_cfg)
             st.session_state.config_yaml = yaml.safe_dump(default_cfg, sort_keys=False)
             st.rerun()
-    with col_c:
         st.download_button(
             "Download Current Config",
             data=st.session_state.config_yaml,
@@ -450,51 +641,35 @@ def main() -> None:
             use_container_width=True,
         )
 
-    st.code(st.session_state.config_yaml, language="yaml")
+        with st.expander("Current config (YAML)", expanded=False):
+            st.code(st.session_state.config_yaml, language="yaml")
 
-    st.subheader("Run Pipeline")
-    run_col1, run_col2 = st.columns([1, 3])
-    with run_col1:
-        run_clicked = st.button("Process Video", type="primary", use_container_width=True)
-    with run_col2:
-        if uploaded_video is None:
-            st.info("Upload a video first, then click Process Video.")
+    config_hash = _config_hash(st.session_state.active_config)
 
-    if run_clicked:
-        if uploaded_video is None:
-            st.error("Please upload a video before processing.")
-        else:
-            with st.spinner("Running BugSpot pipeline..."):
-                video_path, summary, cfg_yaml = _run_pipeline(uploaded_video, st.session_state.active_config)
-                st.session_state.result_video_path = str(video_path)
-                st.session_state.result_video_bytes = video_path.read_bytes()
-                st.session_state.result_summary = summary
-                st.session_state.config_yaml = cfg_yaml
-
-    if "result_summary" in st.session_state:
-        summary = st.session_state.result_summary
-        info = summary["video_info"]
-
-        stat1, stat2, stat3, stat4 = st.columns(4)
-        stat1.metric("Detections", summary["total_detections"])
-        stat2.metric("Confirmed Tracks", summary["confirmed_tracks"])
-        stat3.metric("FPS", f"{info['fps']:.2f}")
-        stat4.metric("Duration (s)", f"{info['duration']:.2f}")
-
-        st.caption(f"Artifacts saved in: {summary['output_dir']}")
-
-    if "result_video_bytes" in st.session_state:
-        st.subheader("Annotated Result Video")
-        _, video_col, _ = st.columns([2, 3, 2])
-        with video_col:
-            st.video(st.session_state.result_video_bytes, format="video/mp4")
-            st.download_button(
-                "Download Annotated Video",
-                data=st.session_state.result_video_bytes,
-                file_name="bugspot_annotated_result.mp4",
-                mime="video/mp4",
-                use_container_width=True,
+    with right_col:
+        st.subheader("Test Videos")
+        with st.expander("Add more videos", expanded=False):
+            more_uploads = st.file_uploader(
+                "Upload additional test videos",
+                type=["mp4", "mov", "avi", "mkv", "m4v"],
+                accept_multiple_files=True,
+                key="more_video_uploader",
             )
+            if more_uploads and st.button("Save uploaded videos", key="save_more_videos"):
+                with st.spinner("Saving uploaded videos..."):
+                    _save_uploaded_videos(more_uploads)
+                st.rerun()
+
+        batch_mode = st.toggle(
+            "Batch mode — process all videos in sequence",
+            key="batch_mode",
+            help="Off: pick one video and process it. On: process every test video one after another.",
+        )
+
+        if batch_mode:
+            _render_batch_mode(videos, st.session_state.active_config, config_hash)
+        else:
+            _render_single_mode(videos, st.session_state.active_config, config_hash)
 
 
 if __name__ == "__main__":
