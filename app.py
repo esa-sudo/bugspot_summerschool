@@ -488,6 +488,13 @@ def main() -> None:
         _, video_col, _ = st.columns([2, 3, 2])
         with video_col:
             st.video(st.session_state.result_video_bytes, format="video/mp4")
+            st.download_button(
+                "Download Annotated Video",
+                data=st.session_state.result_video_bytes,
+                file_name="bugspot_annotated_result.mp4",
+                mime="video/mp4",
+                use_container_width=True,
+            )
 
 
 if __name__ == "__main__":
