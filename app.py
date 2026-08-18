@@ -1,12 +1,17 @@
+import bisect
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import imageio_ffmpeg
+import numpy as np
 import streamlit as st
 import yaml
 
@@ -355,6 +360,29 @@ def _store_cached_result(
     summary_path.write_text(json.dumps(summary))
 
 
+def _build_track_trails(
+    all_detections,
+) -> Tuple[Dict[str, List[int]], Dict[str, List[Tuple[int, int]]], Dict[str, Tuple[int, int]]]:
+    """Per track: sorted frame numbers, matching centroid points, and (first, last) active frame."""
+    track_points: Dict[str, List[Tuple[int, int, int]]] = defaultdict(list)
+    for det in all_detections:
+        track_id = det.get("track_id") or "unknown"
+        x1, y1, x2, y2 = det["bbox"]
+        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+        track_points[track_id].append((det["frame_number"], cx, cy))
+
+    frame_numbers: Dict[str, List[int]] = {}
+    trail_points: Dict[str, List[Tuple[int, int]]] = {}
+    frame_range: Dict[str, Tuple[int, int]] = {}
+    for track_id, pts in track_points.items():
+        pts.sort(key=lambda p: p[0])
+        frame_numbers[track_id] = [p[0] for p in pts]
+        trail_points[track_id] = [(p[1], p[2]) for p in pts]
+        frame_range[track_id] = (pts[0][0], pts[-1][0])
+
+    return frame_numbers, trail_points, frame_range
+
+
 def _annotate_output_video(
     input_video_path: Path,
     output_dir: Path,
@@ -364,45 +392,66 @@ def _annotate_output_video(
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "annotated_result.mp4"
 
-    by_frame: Dict[int, list] = {}
+    by_frame: Dict[int, list] = defaultdict(list)
     for det in all_detections:
-        by_frame.setdefault(det["frame_number"], []).append(det)
+        by_frame[det["frame_number"]].append(det)
+
+    track_frame_numbers, track_trail_points, track_frame_range = _build_track_trails(all_detections)
 
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
         raise ValueError("Could not open video for annotation")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     if fps <= 0:
         fps = 25.0
 
-    writer = None
-    for codec in ("avc1", "H264", "mp4v"):
-        candidate = cv2.VideoWriter(
-            str(out_path),
-            cv2.VideoWriter_fourcc(*codec),
-            fps,
-            (width, height),
-        )
-        if candidate.isOpened():
-            writer = candidate
-            break
-        candidate.release()
-
-    if writer is None:
+    ok, frame = cap.read()
+    if not ok:
         cap.release()
-        raise RuntimeError("Could not create a video writer with available codecs")
+        raise ValueError("Video has no readable frames")
+    height, width = frame.shape[:2]
+
+    # Encode with ffmpeg (H.264/yuv420p) instead of cv2.VideoWriter so the
+    # result plays back in-browser via st.video — OpenCV's own writer codecs
+    # (mp4v, etc.) are not reliably playable in HTML5 <video>.
+    ffmpeg_cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",
+        "-an",
+        "-vcodec", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    proc = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     frame_idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    while ok:
+        # Track trail: draw the path travelled so far, only while this track
+        # is active (between its first and last detection frame).
+        for track_id, (first_frame, last_frame) in track_frame_range.items():
+            if not (first_frame <= frame_idx <= last_frame):
+                continue
+            idx = bisect.bisect_right(track_frame_numbers[track_id], frame_idx)
+            if idx < 2:
+                continue
+            confirmed = track_id in confirmed_track_ids
+            color = (0, 220, 0) if confirmed else (0, 165, 255)
+            trail = np.array(track_trail_points[track_id][:idx], dtype=np.int32)
+            cv2.polylines(frame, [trail], isClosed=False, color=color, thickness=1)
 
-        frame_dets = by_frame.get(frame_idx, [])
-        for det in frame_dets:
+        for det in by_frame.get(frame_idx, []):
             x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
             track_id = det.get("track_id") or "unknown"
             short_id = str(track_id)[:8]
@@ -430,14 +479,16 @@ def _annotate_output_video(
             (255, 255, 255),
             2,
         )
-        writer.write(frame)
+        proc.stdin.write(frame.tobytes())
         frame_idx += 1
+        ok, frame = cap.read()
 
-    writer.release()
     cap.release()
+    proc.stdin.close()
+    proc.wait()
 
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        raise RuntimeError("Annotated video was not written correctly")
+    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError("Annotated video was not written correctly (ffmpeg encoding failed)")
 
     return out_path
 
@@ -660,16 +711,11 @@ def main() -> None:
                     _save_uploaded_videos(more_uploads)
                 st.rerun()
 
-        batch_mode = st.toggle(
-            "Batch mode — process all videos in sequence",
-            key="batch_mode",
-            help="Off: pick one video and process it. On: process every test video one after another.",
-        )
-
-        if batch_mode:
-            _render_batch_mode(videos, st.session_state.active_config, config_hash)
-        else:
+        tab_single, tab_batch = st.tabs(["Single Video", "Process All"])
+        with tab_single:
             _render_single_mode(videos, st.session_state.active_config, config_hash)
+        with tab_batch:
+            _render_batch_mode(videos, st.session_state.active_config, config_hash)
 
 
 if __name__ == "__main__":
