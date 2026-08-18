@@ -536,7 +536,7 @@ def _display_result(video_name: str, video_bytes: bytes, summary: Dict[str, Any]
     stat3.metric("FPS", f"{info['fps']:.2f}")
     stat4.metric("Duration (s)", f"{info['duration']:.2f}")
 
-    st.video(video_bytes, format="video/mp4")
+    st.video(video_bytes, format="video/mp4", width=480)
     st.download_button(
         "Download Annotated Video",
         data=video_bytes,
