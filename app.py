@@ -449,7 +449,7 @@ def _annotate_output_video(
             confirmed = track_id in confirmed_track_ids
             color = (0, 220, 0) if confirmed else (0, 165, 255)
             trail = np.array(track_trail_points[track_id][:idx], dtype=np.int32)
-            cv2.polylines(frame, [trail], isClosed=False, color=color, thickness=1)
+            cv2.polylines(frame, [trail], isClosed=False, color=color, thickness=3)
 
         for det in by_frame.get(frame_idx, []):
             x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
@@ -549,13 +549,20 @@ def _display_result(video_name: str, video_bytes: bytes, summary: Dict[str, Any]
 
 def _video_nav(videos: List[Path], key_prefix: str) -> Path:
     total = len(videos)
+    select_key = f"select_{key_prefix}"
+
     nav_prev, nav_label, nav_next = st.columns([1, 5, 1])
     with nav_prev:
         if st.button("◀", use_container_width=True, key=f"prev_{key_prefix}"):
             st.session_state.video_idx = (st.session_state.video_idx - 1) % total
+            # Keep the selectbox's own remembered value in sync — Streamlit
+            # restores a keyed widget's last value on rerun, which would
+            # otherwise silently overrule this button click.
+            st.session_state[select_key] = st.session_state.video_idx
     with nav_next:
         if st.button("▶", use_container_width=True, key=f"next_{key_prefix}"):
             st.session_state.video_idx = (st.session_state.video_idx + 1) % total
+            st.session_state[select_key] = st.session_state.video_idx
 
     with nav_label:
         selected_idx = st.selectbox(
@@ -564,11 +571,10 @@ def _video_nav(videos: List[Path], key_prefix: str) -> Path:
             index=st.session_state.video_idx,
             format_func=lambda i: videos[i].name,
             label_visibility="collapsed",
-            key=f"select_{key_prefix}",
+            key=select_key,
         )
     if selected_idx != st.session_state.video_idx:
         st.session_state.video_idx = selected_idx
-        st.rerun()
 
     current_video = videos[st.session_state.video_idx]
     st.caption(f"Video {st.session_state.video_idx + 1} of {total}: {current_video.name}")
@@ -654,9 +660,9 @@ def main() -> None:
     if not videos:
         st.subheader("Upload Test Videos")
         st.info(
-            "No videos found on the server yet. Upload your test videos below — "
-            "they are saved to the server's disk, not committed to git, and only "
-            "need to be uploaded once per server session."
+            "No videos found on the server yet. Download your test videos from the test_video folder on your drive."
+            "Then, upload them here."
+            "They only need to be uploaded once per server session."
         )
         uploaded_videos = st.file_uploader(
             "Upload test videos",
